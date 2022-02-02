@@ -1,0 +1,309 @@
+---
+author: "Augustine Malija (198645)"
+title: "Statistical Modeling and Causal Inference"  
+subtitle: "Preventing and Responding to Dissent:The Observational Challenges of Explaining Strategic Repression"
+date: "25/5/2020"
+output: html_document
+---
+## Brief Summary of the Original Study
+
+The study is about how citizen's mobilized dissent determines responsive state repression. It argues that the extent of dissent differs between urban and rural areas - with one for urban being pronounced because of supportive infrastructure. It uses rainfall data in African provinces and US States with data on dissent and repression. Data is sourced from the Social Conflict Analysis Database (SCAD) and the Dynamics of Collective Action (DCA) Data project report. These databases provide subdaily information on dissent and repression in Africa and the United States, respectively.The Authors pair these conflict data with daily recorded rainfall for each province in Africa from 1990 to 2012 and each state in the United States from 1974 to 1995.
+
+The study uses rain as an instrument and urbanization as a control variable. It argues that with rain, people are demotivated to go out and dissent. Rain appears to be a strong instrument because it addresses well the following assumptions; it does not have a causal effect on repression (**the outcome**), it has a causal effect on dissent and it is randomly assigned to units or as if random since protestors can't help if it rains or not. The study finds that dissent fails to have a significant effect on responsive repression in states that engage in preventive repression. This is because dissent is endogenous to repression --- the state prevents dissent from ever occuring and groups self censor in anticipation of repression.
+
+## Analytics
+
+### Loading Packages
+```{r, warning=FALSE, message=FALSE}
+library(readr)#for reading datasets in R
+library(tidyverse)#for data wrangling
+library(haven)#for reading datasets in R
+library(dplyr)#for data wrangling
+library(AER)#for iv regressions
+library(stargazer)#for a table of regression results
+library(kableExtra)#for formatting dataframes
+library(MatchIt)#for matching
+library(cem)# for CEM matching
+library(broom)#for converting regression models to a tidy data frame.
+library(ggplot2)#for visualizing results
+library(scales)# for an easier read of the x axis
+
+options(scipen = 999)
+
+set.seed(123)#for consistent results
+```
+
+### Reading Datasets
+```{r, warning=FALSE}
+#naming datasets
+rain_data <- haven::read_dta("RC_APSR_Data.dta")
+latent_dem <- haven::read_dta("Latent_Democracy.dta")
+quality_gov <- haven::read_dta("QoGData.dta")
+```
+
+### Rain Data Manipulation
+```{r}
+rain_data_new <- rain_data %>% 
+  #arranging cow and year in a descending order
+  arrange(cow,year) %>% 
+  #rearranging and dropping unnecessary columns to ease creation of dissent and repress count columns
+  dplyr::select(adm0_adm1:rainannualpct, etype2:etype6,etype8, escalation1:escalation6, escalation8,escalation7,repBINARYone, repBINARYtwo, -c(escalation9, escalation10, repress2, repBINARYzero, etype7, etype9,etype10, etypeNEG9, escalation0)) %>% 
+  #summation of variables to create represscount and dissentcount variables using placeholder assignee and indexing
+  mutate(dissentcount=rowSums(.[which(colnames(.)=="etype2"):which(colnames(.)=="escalation8")], na.rm=TRUE),
+         represscount=rowSums(.[which(colnames(.)=="escalation7"):which(colnames(.)=="repBINARYtwo")], na.rm = TRUE)) %>% #dropping unwanted variables from etype2 to repBINARYtwo after the aforementioned creation
+  dplyr::select(-c(etype2:repBINARYtwo)) %>% 
+  #creating repressbinary variable
+  mutate(repressbinary=if_else(.$represscount>=1,1,0)) %>% 
+  #creating dissent binary variable
+  mutate(dissentbinary=if_else(.$dissentcount>=1,1,0)) %>% 
+  #creating lograin variable through a natural log
+  mutate(lograin=log(rainnonull_mean)) %>% 
+  #replacing NAs and infinity values with zero
+  mutate(lograin=replace(lograin, is.na(lograin),0),
+         lograin=replace(lograin, lograin=="-Inf",0))
+```
+
+
+### Joining Datasets
+```{r, warning=FALSE, message=FALSE}
+latent_dem <- latent_dem %>% 
+  #creating a latent democracy binary variable using mean as determinant among the descriptive statistics
+  mutate(latent_democracy=if_else(latent_dem$mean>=0,1,0)) %>% 
+  #removing unnecesary columns
+  dplyr::select(-c(mean, sd, median, pct025, pct975))
+
+
+#Selecting wdi_gdp variable 
+quality_gov <- quality_gov %>% 
+  dplyr::select(year, cow, cname, wdi_gdp)
+
+
+#joining the three datasets
+rain_data_joined <- rain_data_new %>%
+  #joining with latent democracy dataset using the left join to make sure I retain the same number of observations
+  left_join(latent_dem, by=c("cow", "year")) %>% 
+  #creating democracy dissent binary variable
+  mutate(democracy_dissent=latent_democracy*dissentcount) %>% 
+  #creating democracy rain variable
+  mutate(democracy_rain=latent_democracy*lograin) %>% 
+  #creating democracy full rain variable
+  mutate(democracy_full_rain=latent_democracy*rainnonull_mean) %>% 
+  #creating rain deviations variable
+  mutate(rain_deviations=rainnonull_mean-(annualrainsum/365)) %>% 
+  #joining with quality gov dataset using left join for aforementioned reasons
+  left_join(quality_gov, by=c("cow", "year")) %>% 
+  #assigning lograin as a binary variable
+  mutate(rain_treatment=ifelse(.$lograin<=0,0,1))
+```
+### Preparing Data for Matching
+```{r, warning=FALSE, message=FALSE}
+nas_omitted <- rain_data_joined %>% 
+  #picking all necessary columns for matching
+  dplyr::select(adm0_name, cow, year, urban_mean, pop_sum, wdi_gdp,rain_treatment, rainnonull_mean, lograin, rain_deviations, represscount, dissentcount, rainannualpct, latent_democracy) %>% 
+  #ommitting NAs since matching does not want them
+  na.omit()
+
+#performing a CEM match using MatchIt package
+cem_match <- matchit(rain_treatment ~ urban_mean + pop_sum + wdi_gdp, method = "cem", data = nas_omitted)
+
+match_data <- match.data(cem_match)
+
+```
+
+
+### Regressions
+```{r, message=FALSE, error=FALSE}
+#OLS Regression
+OLS_Regression <- lm(represscount~dissentcount+urban_mean, data = rain_data_joined)
+
+#Instrumental variable regressions
+Basic_IV_Reg <- ivreg(represscount ~ dissentcount + urban_mean | lograin + rainannualpct +urban_mean, data = rain_data_joined)
+
+NonDemocracies_IV_Reg <- ivreg(represscount ~ dissentcount + urban_mean | lograin + rainannualpct + urban_mean, data = rain_data_joined %>% dplyr::filter(latent_democracy==0))
+
+Democracies_IV_Reg <- ivreg(represscount ~ dissentcount + urban_mean | lograin + rainannualpct + urban_mean, data = rain_data_joined %>% dplyr::filter(latent_democracy==1))
+
+#Matched Regressions
+NonDemocracies_Matched_Reg <- ivreg(represscount ~ dissentcount + urban_mean | urban_mean + lograin + rainannualpct, data = match_data %>% dplyr::filter(latent_democracy==0[weights]))
+
+Democracies_Matched_Reg <- ivreg(represscount ~ dissentcount + urban_mean | urban_mean + lograin + rainannualpct, data = match_data %>% dplyr::filter(latent_democracy==1[weights]))
+```
+
+
+## Question 1: Replicating the Results Table
+```{r, results="asis"}
+stargazer(OLS_Regression, Basic_IV_Reg, NonDemocracies_IV_Reg,Democracies_IV_Reg,NonDemocracies_Matched_Reg, Democracies_Matched_Reg, title = "The Effect of Mobilized Dissent on State Repression", dep.var.labels = "Repression", dep.var.caption = "Dependent Variables", column.labels = c("OLS", "Basic IV Regression","IV Regression(Non Democracies)","IV Regression(Democracies)","Matched Regression (Non Democracies)","Matched Regression (Democracies)"), covariate.labels =c("Dissent","Urbanization","Constant"), align = TRUE, omit.stat = c("LL","ser","f"), no.space = TRUE, type = "html")
+```
+In comparison to the table in the paper, I miss the first stage model numbers because the methodology I use to run intrumental variable regressions automatically returns second stage regression numbers.
+
+I observe that my matched regression estimates do not exactly match the paper's. This is because my methodolgy for matching is different from the paper's methodology. It is also important to note that contrary to the paper, a coefficient for mobilized dissent on the non democracy matched regression is positive. This is not worrisome since it is not statistically significant and is quite close to zero.
+
+I learn that dissent has a positive relationship with repression in non democracies from both instrumental variable and matched regressions --- but statistically insignificant. This is because non-democractic countries use stringent measures that deter people's freedom of expression. However, it is statistically significant in democracies because there is freedom of expression.
+
+### Preparing Regression Outputs for Plotting
+```{r, message=FALSE, error=FALSE}
+#Creating dataframes for the separate regressions
+OLS_Reg <- lm(represscount~dissentcount+urban_mean, data = rain_data_joined)
+
+OLS_Reg <- tidy(OLS_Reg)
+OLS_Reg <- OLS_Reg %>% 
+  #adding a modelling strategy column for a descriptive plot
+  mutate(modeling_strategy=NA) %>% 
+  #Replacing NAs a relevant model
+  mutate(modeling_strategy=replace(modeling_strategy, is.na(modeling_strategy),"OLS Regression"))
+
+Basic_IV_Regression <- ivreg(represscount ~ dissentcount + urban_mean | lograin + rainannualpct +urban_mean, data = rain_data_joined)
+
+Basic_IV_Regression <- tidy(Basic_IV_Regression)
+Basic_IV_Regression <- Basic_IV_Regression %>% 
+  #adding a modeling strategy column for a descriptive plot
+  mutate(modeling_strategy=NA) %>% 
+  #REPLACING NAs with a relevant model
+  mutate(modeling_strategy=replace(modeling_strategy, is.na(modeling_strategy),"Basic IV Regression"))
+
+#Non Democracies IV
+NonDemocracies_IV_Regression <- ivreg(represscount ~ dissentcount + urban_mean | lograin + rainannualpct + urban_mean, data = rain_data_joined %>% dplyr::filter(latent_democracy==0))
+
+NonDemocracies_IV_Regression <- tidy(NonDemocracies_IV_Regression)
+NonDemocracies_IV_Regression <- NonDemocracies_IV_Regression %>%
+  #adding a modeling strategy column for a descriptive plot
+  mutate(modeling_strategy=NA) %>% 
+  #replacing NAs with NonDemocracies IV Regression
+  mutate(modeling_strategy=replace(modeling_strategy, is.na(modeling_strategy),"NonDemocracies IV Regression"))
+
+#Democracies IV Regression
+Democracies_IV_Regression <- ivreg(represscount ~ dissentcount + urban_mean | lograin + rainannualpct + urban_mean, data = rain_data_joined %>% dplyr::filter(latent_democracy==1))
+
+Democracies_IV_Regression <- tidy(Democracies_IV_Regression)
+Democracies_IV_Regression <- Democracies_IV_Regression %>%
+  #adding modeling strategy column for a descriptive plot
+  mutate(modeling_strategy=NA) %>%
+  #replacing NAs with Democracies IV Regression
+  mutate(modeling_strategy=replace(modeling_strategy, is.na(modeling_strategy),"Democracies IV Regression"))
+  
+#Matched Non Democracies
+NonDemocracies_Matched_Regression <- ivreg(represscount ~ dissentcount + urban_mean | urban_mean + lograin + rainannualpct, data = match_data %>% dplyr::filter(latent_democracy==0[weights]))
+
+NonDemocracies_Matched_Regression <- tidy(NonDemocracies_Matched_Regression)
+NonDemocracies_Matched_Regression <- NonDemocracies_Matched_Regression %>% 
+  #adding the modeling strategy column for a descriptive plot
+  mutate(modeling_strategy=NA) %>% 
+  #replacing NAs with respective model
+  mutate(modeling_strategy=replace(modeling_strategy, is.na(modeling_strategy),"NonDemocracies Matched Regressions"))
+
+#Matched Democracies
+Democracies_Matched_Regression <- ivreg(represscount ~ dissentcount + urban_mean | urban_mean + lograin + rainannualpct, data = match_data %>% dplyr::filter(latent_democracy==1[weights]))
+
+Democracies_Matched_Regression <- tidy(Democracies_Matched_Regression)
+Democracies_Matched_Regression <- Democracies_Matched_Regression %>%
+  #adding modeling strategy column for a descriptive plot
+  mutate(modeling_strategy=NA) %>% 
+  #replacing NAs with respective model
+  mutate(modeling_strategy=replace(modeling_strategy, is.na(modeling_strategy),"Democracies Matched Regressions"))
+
+#Binding the six data frames together
+Combined_Models <- rbind(OLS_Reg,Basic_IV_Regression, NonDemocracies_IV_Regression, Democracies_IV_Regression, NonDemocracies_Matched_Regression, Democracies_Matched_Regression) %>% 
+  #omitting unnecessary columns
+  dplyr::select(-c(statistic,p.value))
+```
+
+
+## Question 2: Plotting the Combined Regression Results
+```{r}
+ggplot(Combined_Models,
+       aes(x=term, 
+             y=estimate,
+             color=modeling_strategy)) +
+  geom_hline(yintercept = 0, color="grey", lty=2) +
+  geom_point()+
+  geom_linerange(aes(ymin=estimate - 1.96*std.error, ymax=estimate+1.96*std.error), position = position_dodge(width = 1/2))+
+  geom_linerange(aes(ymin=estimate-1.65*std.error, ymax=estimate+1.65*std.error), position = position_dodge(width = 1/2),
+                 size=1.2)+
+  labs(x="Independent Variables",
+       y="Repression (Estimates) on Confidence Intervals")+
+  theme_light()
+
+```
+
+
+## Question 3: Extension
+
+### Testing Interactive Relationships
+
+Page 87 of the paper expresses a need for interacting other covariates with dissent to explain how it determines repression as quoted here **Even when it is not directly modeled in empirical analysis, scholars recognize the need to account for dissent and approximate for predictors of dissent in models of repression, including inequality, economic growth, and population size.**
+
+I go on to test the effect of the interactive relationship between population and mobilized dissent on repression. To plot how it determines repression, I hold dissent constant at its minimum and maximum points `(0 and 5 repectively)` as shown in the following code.
+
+### Predicting Fitted Values
+```{r}
+#running a linear model of the interaction between popolation and dissent
+#I omitt NAs in my dataset because with NAs ggplot will not be able to plot
+interactions <- lm(represscount~pop_sum*dissentcount, data = nas_omitted)
+
+range(nas_omitted$pop_sum)#to aid in setting population to millions
+summary(nas_omitted$dissentcount)#to aid in determining a bandwidth for holding it constant
+
+#holding dissent constant while allowing population to vary in millions
+pre_pred <- data.frame(expand.grid(pop_sum=seq(min(nas_omitted$pop_sum), max(nas_omitted$pop_sum), 1000000),
+                                 dissentcount=c(min(nas_omitted$dissentcount),
+                                              max(nas_omitted$dissentcount))))
+
+#predicting fitted values
+predicted <- predict(interactions,pre_pred, se = T)
+#combining the two data frames to have a data frame with fitted values
+df_predicted <- cbind(pre_pred, predicted)
+```
+
+### Plotting the Interaction
+```{r}
+#specifying plotting colors for the confidence intervals
+plotcols <-c("cornflowerblue","goldenrod") 
+
+#plotting the interactions
+ggplot(df_predicted,
+       aes(x=pop_sum,
+           y=fit,
+           color=factor(dissentcount)))+
+  geom_line(aes())+
+  #specifying the confidence intervals
+  geom_ribbon(aes(ymin=fit-1.96*se.fit, ymax=fit+1.96*se.fit, fill=factor(dissentcount)),
+              alpha=0.2,
+              color=NA)+
+  #specifying lables for dissent at points it is held constant
+  scale_fill_manual(labels=c("Minimum Dissent",
+                             "Maximum Dissent"),
+                    name="",
+                    values = plotcols)+
+  #Naming my x and y axis
+  labs(x="Population (Millions)",
+       y="Repression (fitted values) with 95% CI")+
+  theme_light()+
+  #positioning my legend
+  theme(legend.position = "top",
+        panel.grid.minor = element_blank())+
+  #deploying the scales package
+  scale_x_continuous(labels = label_number(scale=1/1e6))
+```
+
+In line with theory. Like urbanization, popupation affects repression positively. The plot shows that as population increases, so does repression at both levels where dissent is held constant. This is inline with the paper's argument that urban areas are more likely to dissent and thus face relatively more repression as opposed to rural areas.
+
+The plot goes in line with a linear model with such interaction effects, it leads to a positive effect on repression. I show this in the following linear model.
+
+```{r, results="asis"}
+#linear model
+all_cov <- lm(represscount~dissentcount+pop_sum+dissentcount*pop_sum, data = rain_data_joined)
+
+stargazer(all_cov, title = "Interaction Effects of Population on Repression", dep.var.labels = "Repression", dep.var.caption = "Dependent Variables",covariate.labels =c("Dissent","Population","Dissent:Population","Constant"), align = TRUE, omit.stat = c("LL","ser","f"), no.space = TRUE, type = "html")
+```
+
+```{r}
+#interaction estimate b1(Dissent)+b3(population*Dissent)
+0.23007576852822+0.00000000559400
+```
+
+
+These results show that the conditional avearge treatment effect of the interaction between dissent and population on repression is positive and statistically significant with a magnitude of 0.2300758. This means that growth in pupulation increases the likelihood for repression.
+
+## Sources {-}
+
+Ritter, Emily H. and Courtenay R. Conrad (2016). Preventing and Responding to Dissent: The Observational Challenges of Explaining Strategic Repression. *American Political Sciences Review*
